@@ -10,15 +10,13 @@ from PIL import Image, ImageOps
 
 SCALE_MM_PER_PX = 0.30
 
-EDGE_EXCLUDE_RATIO = 0.08
-L_DARK_THRESH = 18
-A_BROWN_THRESH = 7
-BLACKHAT_THRESH = 13
-MIN_DAMAGE_AREA_PX = 30
-MIN_VISUAL_DAMAGE_AREA_PX = 18
-MIN_LINE_DAMAGE_AREA_PX = 24
-MIN_STRONG_BROWN_DIFF = 6
-MIN_STRONG_DARK_DIFF = 14
+EDGE_EXCLUDE_RATIO = 0.14
+EDGE_HIGH_CONFIDENCE_RATIO = 0.13
+STEM_TOP_EXCLUDE_RATIO = 0.24
+MIN_DAMAGE_AREA_RATIO = 0.00065
+MIN_LINE_DAMAGE_AREA_RATIO = 0.00040
+MIN_DAMAGE_AREA_PX = 100
+MIN_LINE_DAMAGE_AREA_PX = 75
 MAX_COMPONENT_AREA_RATIO = 0.08
 MAX_TOTAL_DAMAGE_RATIO = 0.20
 
@@ -33,7 +31,7 @@ class AnalysisResult:
 
 
 st.set_page_config(
-    page_title="すだち出荷先判定",
+    page_title="すだち選別サポート",
     page_icon="🍋",
     layout="centered",
 )
@@ -41,9 +39,9 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .block-container {max-width: 980px; padding-top: 1.4rem;}
-    .main-title {font-size: clamp(2rem, 7vw, 3.4rem); font-weight: 900; line-height: 1.05;}
-    .lead {font-size: 1.05rem; color: #4b5563; margin-bottom: 1rem;}
+    .block-container {max-width: 920px; padding-top: 3.6rem;}
+    .main-title {font-size: clamp(1.7rem, 6vw, 2.7rem); font-weight: 900; line-height: 1.16;}
+    .lead {font-size: 1rem; color: #4b5563; margin-bottom: 1rem;}
     .result-band {
         border: 1px solid #d9e2d0;
         border-radius: 8px;
@@ -55,14 +53,15 @@ st.markdown(
     .result-value {font-size: clamp(1.8rem, 8vw, 3rem); font-weight: 900; line-height: 1.1;}
     .reason {font-size: clamp(1.05rem, 4vw, 1.35rem); font-weight: 700; line-height: 1.45;}
     div[data-testid="stMetricValue"] {font-size: 1.2rem;}
+    div[data-testid="stImage"] img {max-height: 620px; object-fit: contain;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.markdown('<div class="main-title">すだち出荷先判定</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">すだち選別サポート</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="lead">スマートフォンで撮影した画像をアップロードすると、色・傷・形・サイズから出荷先を提案します。</div>',
+    '<div class="lead">スマートフォンで撮影した画像をアップロードすると、色・傷・形・サイズから選別の目安を表示します。</div>',
     unsafe_allow_html=True,
 )
 
@@ -115,28 +114,46 @@ def estimate_stem_mask(mask_roi: np.ndarray, hsv_roi: np.ndarray, lab_roi: np.nd
     if not np.any(fruit):
         return np.zeros_like(mask_roi)
 
-    top_band = np.zeros_like(mask_roi)
-    top_band[: max(1, int(h * 0.28)), :] = 255
     l_roi = lab_roi[:, :, 0]
-    s_roi = hsv_roi[:, :, 1]
-    v_roi = hsv_roi[:, :, 2]
+    a_roi = lab_roi[:, :, 1]
+    b_roi = lab_roi[:, :, 2]
+    s_roi = hsv_roi[:, :, 1].astype(np.float32)
+    h_roi = hsv_roi[:, :, 0]
 
-    dark_top = ((l_roi < np.percentile(l_roi[fruit], 35)) | (v_roi < 95)) & (s_roi > 25)
-    stem = (dark_top & (top_band > 0) & fruit).astype(np.uint8) * 255
+    mean_l = float(np.mean(l_roi[fruit]))
+    mean_a = float(np.mean(a_roi[fruit]))
+    mean_b = float(np.mean(b_roi[fruit]))
+    ys, xs = np.where(fruit)
+    cx = (xs.min() + xs.max()) / 2
+    cy = (ys.min() + ys.max()) / 2
+    radius = max(w, h) / 2
+    yy, xx = np.indices(mask_roi.shape)
+
+    center_zone = ((xx - cx) ** 2 + (yy - cy) ** 2) < (radius * 0.22) ** 2
+    upper_zone = (yy < cy) & (((xx - cx) ** 2 + (yy - cy) ** 2) < (radius * 0.55) ** 2)
+    stem_zone = fruit & (center_zone | upper_zone)
+    stem_color = (
+        (l_roi > mean_l + 6)
+        | ((a_roi > mean_a + 3) & (b_roi > mean_b + 3) & (l_roi > mean_l - 15))
+        | ((s_roi < 105) & (l_roi > mean_l - 18))
+        | ((h_roi < 38) & (l_roi > mean_l - 25))
+    ) & stem_zone
+    stem = stem_color.astype(np.uint8) * 255
 
     contours, _ = cv2.findContours(stem, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     stem_mask = np.zeros_like(mask_roi)
-    if contours:
-        c = max(contours, key=cv2.contourArea)
+    for c in contours:
         if cv2.contourArea(c) > 8:
             cv2.drawContours(stem_mask, [c], -1, 255, -1)
 
-    stem_mask = cv2.dilate(stem_mask, np.ones((23, 23), np.uint8), iterations=1)
+    stem_mask = cv2.dilate(stem_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (55, 55)), iterations=1)
     return cv2.bitwise_and(stem_mask, mask_roi)
 
 
 def detect_damage(mask_roi, hsv_roi, lab_roi, stem_mask):
     lab_roi = lab_roi.astype(np.float32)
+    lab_roi = cv2.GaussianBlur(lab_roi, (5, 5), 0)
+    hsv_roi = cv2.medianBlur(hsv_roi, 5)
 
     l_roi = lab_roi[:, :, 0]
     a_roi = lab_roi[:, :, 1]
@@ -151,8 +168,12 @@ def detect_damage(mask_roi, hsv_roi, lab_roi, stem_mask):
     max_dist = dist.max()
     if max_dist <= 0:
         inner_mask = mask_roi.copy()
+        high_confidence_mask = mask_roi.copy()
     else:
         inner_mask = ((dist > max_dist * EDGE_EXCLUDE_RATIO) & (mask_roi > 0)).astype(np.uint8) * 255
+        high_confidence_mask = (
+            (dist > max_dist * EDGE_HIGH_CONFIDENCE_RATIO) & (mask_roi > 0)
+        ).astype(np.uint8) * 255
 
     eroded_mask = cv2.erode(inner_mask, np.ones((5, 5), np.uint8))
     if eroded_mask.sum() == 0:
@@ -167,39 +188,46 @@ def detect_damage(mask_roi, hsv_roi, lab_roi, stem_mask):
     mean_a = np.mean(a_roi[fruit_inner])
     mean_b = np.mean(b_roi[fruit_inner])
     mean_s = np.mean(s_roi[fruit_inner])
+    mean_h = float(np.mean(h_roi[fruit_inner]))
+    yellow_fruit = mean_h < 38 and mean_s >= 35
 
-    dark_mask = l_roi < (mean_l - L_DARK_THRESH)
-    brown_mask = a_roi > (mean_a + A_BROWN_THRESH)
-    healthy_green = (h_roi >= 35) & (h_roi <= 85) & (s_roi > mean_s - 8)
-    yellow_mura = (b_roi > mean_b + 8) & (a_roi < mean_a + 12) & (l_roi > mean_l - 18)
+    healthy_green = (h_roi >= 35) & (h_roi <= 90) & (s_roi > max(35, mean_s - 18)) & (a_roi < mean_a + 10)
+    yellow_mura = (b_roi > mean_b + 6) & (a_roi < mean_a + 14) & (l_roi > mean_l - 22) & (h_roi < 45)
 
-    spot_mask = (dark_mask & brown_mask & (~healthy_green) & (~yellow_mura) & fruit_inner).astype(np.uint8) * 255
-    spot_mask = cv2.morphologyEx(spot_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-
-    l_u8 = np.clip(l_roi, 0, 255).astype(np.uint8)
-    bh_h = cv2.morphologyEx(l_u8, cv2.MORPH_BLACKHAT, np.ones((3, 17), np.uint8))
-    bh_v = cv2.morphologyEx(l_u8, cv2.MORPH_BLACKHAT, np.ones((17, 3), np.uint8))
-    blackhat = np.maximum(bh_h, bh_v)
-
-    scratch_mask = (
-        (blackhat > BLACKHAT_THRESH)
-        & (l_roi < mean_l - 12)
-        & (a_roi > mean_a + 5)
+    dark_brown = (
+        (l_roi < mean_l - 22)
+        & (a_roi > mean_a + 8)
+        & (~healthy_green)
+        & (~yellow_mura)
+        & (high_confidence_mask > 0)
+    )
+    dry_scar = (
+        (a_roi > mean_a + 12)
+        & (s_roi < mean_s - 8)
+        & (l_roi > mean_l - 42)
+        & (l_roi < mean_l + 35)
+        & (~yellow_mura)
         & fruit_inner
-    ).astype(np.uint8) * 255
-    scratch_mask = cv2.morphologyEx(scratch_mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    )
 
     stem_inv = cv2.bitwise_not(stem_mask)
-    candidate_mask = cv2.bitwise_or(cv2.bitwise_and(spot_mask, stem_inv), cv2.bitwise_and(scratch_mask, stem_inv))
+    candidate_mask = ((dark_brown | dry_scar).astype(np.uint8)) * 255
+    candidate_mask = cv2.bitwise_and(candidate_mask, stem_inv)
+    candidate_mask[: int(candidate_mask.shape[0] * STEM_TOP_EXCLUDE_RATIO), :] = 0
+    candidate_mask = cv2.morphologyEx(candidate_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    candidate_mask = cv2.morphologyEx(candidate_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(candidate_mask)
     final_mask = np.zeros_like(candidate_mask)
+    min_damage_area = max(MIN_DAMAGE_AREA_PX, fruit_area * MIN_DAMAGE_AREA_RATIO)
+    min_line_area = max(MIN_LINE_DAMAGE_AREA_PX, fruit_area * MIN_LINE_DAMAGE_AREA_RATIO)
+    min_line_length = max(20, max(mask_roi.shape) * 0.035)
 
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
         w0 = stats[i, cv2.CC_STAT_WIDTH]
         h0 = stats[i, cv2.CC_STAT_HEIGHT]
-        if area <= 0 or area / fruit_area > MAX_COMPONENT_AREA_RATIO or area < MIN_VISUAL_DAMAGE_AREA_PX:
+        if area <= 0 or area / fruit_area > MAX_COMPONENT_AREA_RATIO:
             continue
 
         comp_mask = labels == i
@@ -207,17 +235,27 @@ def detect_damage(mask_roi, hsv_roi, lab_roi, stem_mask):
         extent = area / (w0 * h0 + 1e-5)
         dark_diff = mean_l - np.mean(l_roi[comp_mask])
         brown_diff = np.mean(a_roi[comp_mask]) - mean_a
+        saturation_diff = np.mean(s_roi[comp_mask]) - mean_s
+
+        if yellow_fruit and brown_diff < 16:
+            continue
+
+        if area > fruit_area * 0.01 and brown_diff < 18 and extent < 0.25:
+            continue
 
         accepted = False
-        if area >= MIN_DAMAGE_AREA_PX:
-            accepted = extent > 0.18 and brown_diff >= MIN_STRONG_BROWN_DIFF and dark_diff >= MIN_STRONG_DARK_DIFF
+        if area >= min_damage_area:
+            accepted = extent > 0.10 and (
+                (dark_diff >= 22 and brown_diff >= 8)
+                or (brown_diff >= 12 and saturation_diff <= -8)
+            )
         if not accepted:
             accepted = (
-                area >= MIN_LINE_DAMAGE_AREA_PX
+                area >= min_line_area
                 and aspect >= 4.0
-                and max(w0, h0) >= 24
-                and brown_diff >= 4
-                and dark_diff >= 10
+                and max(w0, h0) >= min_line_length
+                and brown_diff >= 9
+                and (dark_diff >= 8 or brown_diff >= 12)
             )
         if accepted:
             final_mask[comp_mask] = 255
@@ -230,7 +268,7 @@ def detect_damage(mask_roi, hsv_roi, lab_roi, stem_mask):
         area = cv2.contourArea(c)
         if area <= 0:
             continue
-        if area < MIN_VISUAL_DAMAGE_AREA_PX or area / fruit_area > MAX_COMPONENT_AREA_RATIO:
+        if area < min_line_area or area / fruit_area > MAX_COMPONENT_AREA_RATIO:
             continue
         damages.append(c)
 
@@ -268,7 +306,7 @@ def classify_destination(
         return (
             "果汁向け",
             "高",
-            "黄色みが強く、青果向けより果汁加工を優先したい状態です。",
+            "黄色みが強く、青果用として長く置くより果汁加工を優先したい状態です。",
             "黄色み強め",
             "要確認",
         )
@@ -284,7 +322,7 @@ def classify_destination(
 
     if damaged:
         return (
-            "早期出荷または果汁向け",
+            "果汁向け寄り",
             "中",
             "軽い傷があります。保存性を考えると長期保管より早めの処理が安心です。",
             "緑系" if green_good else "要確認",
@@ -419,7 +457,7 @@ if result is None:
 st.markdown(
     f"""
     <div class="result-band">
-        <div class="result-label">出荷先提案</div>
+        <div class="result-label">選別提案</div>
         <div class="result-value">{result.destination}</div>
         <div class="result-label" style="margin-top:.9rem;">処理優先度</div>
         <div class="result-value">{result.priority}</div>
@@ -433,7 +471,7 @@ st.markdown(
 st.image(
     cv2.cvtColor(result.annotated_bgr, cv2.COLOR_BGR2RGB),
     caption="赤枠: 傷候補",
-    use_container_width=True,
+    width=min(720, result.annotated_bgr.shape[1]),
 )
 
 st.subheader("詳細")
