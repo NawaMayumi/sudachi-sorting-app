@@ -1,5 +1,7 @@
 import io
+import hashlib
 from dataclasses import dataclass
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -33,27 +35,47 @@ class AnalysisResult:
 st.set_page_config(
     page_title="すだち選別サポート",
     page_icon="🍋",
-    layout="centered",
+    layout="wide",
 )
 
 st.markdown(
     """
     <style>
-    .block-container {max-width: 920px; padding-top: 3.6rem;}
-    .main-title {font-size: clamp(1.7rem, 6vw, 2.7rem); font-weight: 900; line-height: 1.16;}
-    .lead {font-size: 1rem; color: #4b5563; margin-bottom: 1rem;}
+    .block-container {max-width: 1240px; padding-top: 2.2rem; padding-bottom: 1.2rem;}
+    .main-title {font-size: clamp(1.35rem, 3vw, 2rem); font-weight: 900; line-height: 1.12;}
+    .lead {font-size: .92rem; color: #4b5563; margin-bottom: .65rem;}
     .result-band {
         border: 1px solid #d9e2d0;
         border-radius: 8px;
-        padding: 1rem;
-        margin: 1rem 0;
+        padding: .8rem .9rem;
+        margin: 0;
         background: #f8fbf4;
     }
-    .result-label {font-size: .9rem; color: #526047; font-weight: 700;}
-    .result-value {font-size: clamp(1.8rem, 8vw, 3rem); font-weight: 900; line-height: 1.1;}
-    .reason {font-size: clamp(1.05rem, 4vw, 1.35rem); font-weight: 700; line-height: 1.45;}
-    div[data-testid="stMetricValue"] {font-size: 1.2rem;}
-    div[data-testid="stImage"] img {max-height: 620px; object-fit: contain;}
+    .result-label {font-size: .78rem; color: #526047; font-weight: 800; margin-bottom: .12rem;}
+    .result-value {font-size: clamp(1.35rem, 3vw, 2rem); font-weight: 900; line-height: 1.05; margin-bottom: .55rem;}
+    .priority-value {font-size: clamp(1.15rem, 2.4vw, 1.65rem); font-weight: 900; line-height: 1.05; margin-bottom: .55rem;}
+    .reason {font-size: .98rem; font-weight: 700; line-height: 1.42;}
+    .detail-title {font-size: .95rem; font-weight: 900; margin-bottom: .35rem;}
+    .detail-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: .42rem;
+    }
+    .detail-item {
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        padding: .45rem .55rem;
+        background: #fff;
+    }
+    .detail-key {font-size: .72rem; color: #6b7280; font-weight: 700;}
+    .detail-val {font-size: .98rem; font-weight: 850; line-height: 1.2; overflow-wrap: anywhere;}
+    div[data-testid="stImage"] img {max-height: 390px; object-fit: contain;}
+    div[data-testid="stImage"] {text-align: center;}
+    .stDataFrame {font-size: .85rem;}
+    @media (max-width: 900px) {
+        .block-container {padding-top: 3rem;}
+        div[data-testid="stImage"] img {max-height: 430px;}
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -66,8 +88,13 @@ st.markdown(
 )
 
 
-def load_image(uploaded_file) -> np.ndarray | None:
-    data = uploaded_file.read()
+if "analysis_log" not in st.session_state:
+    st.session_state.analysis_log = []
+if "last_analysis_key" not in st.session_state:
+    st.session_state.last_analysis_key = None
+
+
+def load_image(data: bytes) -> np.ndarray | None:
     pil_image = Image.open(io.BytesIO(data))
     pil_image = ImageOps.exif_transpose(pil_image).convert("RGB")
     rgb = np.array(pil_image)
@@ -418,6 +445,39 @@ def analyze_sudachi(img_bgr: np.ndarray, scale: float) -> AnalysisResult | None:
     return AnalysisResult(annotated, destination, priority, reason, details)
 
 
+def make_log_row(file_name: str, result: AnalysisResult) -> dict:
+    details = result.details
+    return {
+        "時刻": datetime.now().strftime("%H:%M:%S"),
+        "ファイル名": file_name,
+        "選別提案": result.destination,
+        "優先度": result.priority,
+        "理由": result.reason,
+        "傷数": details["傷数"],
+        "傷面積": details["傷面積"],
+        "H値": details["H値"],
+        "S値": details["S値"],
+        "色判定": details["色判定"],
+        "色ムラ": details["色ムラ"],
+        "色ムラ判定": details["色ムラ判定"],
+        "円形度": details["円形度"],
+        "サイズ区分": details["サイズ区分"],
+    }
+
+
+def render_details(details: dict) -> None:
+    items = "".join(
+        f"""
+        <div class="detail-item">
+            <div class="detail-key">{key}</div>
+            <div class="detail-val">{value}</div>
+        </div>
+        """
+        for key, value in details.items()
+    )
+    st.markdown(f'<div class="detail-title">詳細</div><div class="detail-grid">{items}</div>', unsafe_allow_html=True)
+
+
 with st.sidebar:
     st.header("設定")
     scale = st.number_input(
@@ -442,7 +502,8 @@ if uploaded_file is None:
     st.stop()
 
 try:
-    image_bgr = load_image(uploaded_file)
+    image_bytes = uploaded_file.getvalue()
+    image_bgr = load_image(image_bytes)
 except Exception as exc:
     st.error(f"画像を読み込めませんでした: {exc}")
     st.stop()
@@ -454,28 +515,52 @@ if result is None:
     st.error("すだちの輪郭を検出できませんでした。背景を明るくして、1個だけ大きめに写してください。")
     st.stop()
 
-st.markdown(
-    f"""
-    <div class="result-band">
-        <div class="result-label">選別提案</div>
-        <div class="result-value">{result.destination}</div>
-        <div class="result-label" style="margin-top:.9rem;">処理優先度</div>
-        <div class="result-value">{result.priority}</div>
-        <div class="result-label" style="margin-top:.9rem;">理由</div>
-        <div class="reason">{result.reason}</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+analysis_key = f"{hashlib.sha256(image_bytes).hexdigest()}:{scale:.3f}"
+if analysis_key != st.session_state.last_analysis_key:
+    st.session_state.analysis_log.insert(0, make_log_row(uploaded_file.name, result))
+    st.session_state.analysis_log = st.session_state.analysis_log[:30]
+    st.session_state.last_analysis_key = analysis_key
 
-st.image(
-    cv2.cvtColor(result.annotated_bgr, cv2.COLOR_BGR2RGB),
-    caption="赤枠: 傷候補",
-    width=min(720, result.annotated_bgr.shape[1]),
-)
+result_col, image_col, detail_col = st.columns([1.05, 1.05, 1.25], gap="medium")
 
-st.subheader("詳細")
-detail_df = pd.DataFrame(
-    [{"項目": key, "値": value} for key, value in result.details.items()]
-)
-st.dataframe(detail_df, hide_index=True, use_container_width=True)
+with result_col:
+    st.markdown(
+        f"""
+        <div class="result-band">
+            <div class="result-label">選別提案</div>
+            <div class="result-value">{result.destination}</div>
+            <div class="result-label">処理優先度</div>
+            <div class="priority-value">{result.priority}</div>
+            <div class="result-label">理由</div>
+            <div class="reason">{result.reason}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with image_col:
+    st.image(
+        cv2.cvtColor(result.annotated_bgr, cv2.COLOR_BGR2RGB),
+        caption="赤枠: 傷候補",
+        use_container_width=True,
+    )
+
+with detail_col:
+    render_details(result.details)
+
+st.divider()
+
+history_col, action_col = st.columns([4, 1], vertical_alignment="center")
+with history_col:
+    st.subheader("診断ログ")
+with action_col:
+    if st.button("ログを消去", use_container_width=True):
+        st.session_state.analysis_log = []
+        st.session_state.last_analysis_key = None
+        st.rerun()
+
+if st.session_state.analysis_log:
+    log_df = pd.DataFrame(st.session_state.analysis_log)
+    st.dataframe(log_df, hide_index=True, use_container_width=True, height=260)
+else:
+    st.info("この画面で診断した結果がここに残ります。")
